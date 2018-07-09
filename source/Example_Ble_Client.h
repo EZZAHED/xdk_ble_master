@@ -45,7 +45,8 @@
 #define XDK110_XDKAPPLICATIONTEMPLATE_H_
 
 /* local interface declaration ********************************************** */
-/* Priorities */
+#include "BCDS_Basics.h"
+
 #define TASK_PRIO_MAIN_CMD_PROCESSOR                (UINT32_C(1))
 #define TASK_STACK_SIZE_MAIN_CMD_PROCESSOR          (UINT16_C(700))
 #define TASK_Q_LEN_MAIN_CMD_PROCESSOR                (UINT32_C(10))
@@ -54,6 +55,24 @@
 #define ENABLE_FLAG                   UINT8_C(1)                       /**< macro to represent the "enable" */
 #define DISABLE_FLAG                  UINT8_C(0)                       /**< macro to represent the "Disable" */
 #define MAX_DEVICE_LENGTH             UINT8_C(20)                      /**< The Maximum length of bluetooth device name */
+#define BLE_RECEIVE_BUFFER_SIZE       UINT8_C(32)                      /**< Buffer size for commands received over BLE*/
+#define NUMBER_ZERO 			      UINT8_C(0)                       /**< Zero value for BLE variables */
+#define NUMBER_ONE 			          UINT8_C(1)                       /**< One value for BLE variables */
+
+#define BLE_TX_FREQ                 	UINT32_C(1000)             		/**< Macro to represent One second time unit*/
+#define TIMER_AUTORELOAD_ON           	UINT32_C(1)            		/**< Auto reload of timer is enabled*/
+#define TIMER_AUTORELOAD_OFF          	UINT32_C(0)             	/**< Auto reload of timer is disabled*/
+#define BLE_TRIGGER_START_CMD      		UINT32_C(1)
+#define BLE_TRIGGER_END_CMD      		UINT32_C(0)
+#define BLE_SEND_TIMEOUT       			UINT32_C(1000)
+#define ONESECONDDELAY 			      	UINT16_C(1000)	               /**< one second is represented by this macro */
+#define NUMBER_ZERO 			      	UINT8_C(0)                       /**< Zero value for BLE variables */
+#define NUMBER_ONE 			          	UINT8_C(1)                       /**< One value for BLE variables */
+#define XDK_BLE_DEVICE_NAME           "XDK_BLE_SEND"              		   /**< Name of the BLE device*/
+#define BLE_START_SYNC_TIMEOUT        UINT32_C(5000)
+#define BLE_WAKEUP_SYNC_TIMEOUT       UINT32_C(5000)
+
+
 
 
 /* local function prototype declarations */

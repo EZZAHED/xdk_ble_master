@@ -46,51 +46,63 @@
  *
  * @file
  **/
+
 /* module includes ********************************************************** */
+
+#include "XDKAppInfo.h"
+#undef BCDS_MODULE_ID  /* Module ID define before including Basics package*/
+#define BCDS_MODULE_ID XDK_APP_MODULE_ID_ACCEL_OVER_BLE
 
 /* system header files */
 #include <stdio.h>
-/* additional interface header files */
-#include "FreeRTOS.h"
-#include "timers.h"
-
-/* own header files */
-#include <stdio.h>
-#include "BCDS_Basics.h"
-
-/* additional interface header files */
-#include "BCDS_Assert.h"
-#include "FreeRTOS.h"
-#include "timers.h"
-#include "task.h"
-#include "BCDS_CmdProcessor.h"
-//#include "BleAlpwDataExchange_Server.h"
-#include "BleAlpwDataExchange_Client.h"
-#include "XdkUsbResetUtility.h"
-
-/* ble */
-#include "BleEngine.h"
-#include "BleGap.h"
 
 /* own header files */
 #include "Example_Ble_Client.h"
+
+/* additional interface header files */
+#include "FreeRTOS.h"
+#include "timers.h"
+#include "semphr.h"
+#include "task.h"
+
+#include "XdkSensorHandle.h"
+#include "XdkUsbResetUtility.h"
+
+#include "BCDS_Basics.h"
+#include "BCDS_Assert.h"
+#include "BCDS_CmdProcessor.h"
+#include "BCDS_BlePeripheral.h"
+#include "BCDS_Retcode.h"
+#include "BCDS_BidirectionalService.h"
+#include "BCDS_Ble.h"
+
+#include "BleEngine.h"
+#include "BleGap.h"
+#include "BleAlpwDataExchange_Client.h"
 
 /* constant definitions ***************************************************** */
 
 /* local variables ********************************************************** */
 CmdProcessor_T *AppCmdProcessorHandle;
-
 static volatile uint8_t isInterruptHandled = ENABLE_FLAG;
 static uint8_t recievedData[MAX_DEVICE_LENGTH];
 
 static BleHandler bleHandler;
-static BD_ADDR hc05Ble_address;
+static BD_ADDR hc05Ble_address; // hc05 ARDUINO module BLE Address
 static U8 txData[10];
 
 static BleAlpwDataExchangeClient bleAlpwDataExchangeClient;
 static U16 connHandle = 0;
 
 /* global variables ********************************************************* */
+
+static xTimerHandle bleTransmitTimerHandle; /**< variable to store timer handle*/
+CmdProcessor_T *AppCmdProcessorHandle;
+static uint8_t bleTransmitStatus = NUMBER_ZERO; /**< Validate the repeated start flag */
+static xTimerHandle bleTransmitTimerHandle; /**< variable to store timer handle*/
+static SemaphoreHandle_t BleStartSyncSemphr = NULL;
+static SemaphoreHandle_t BleWakeUpSyncSemphr = NULL;
+static SemaphoreHandle_t SendCompleteSync = NULL;
 
 /* inline functions ********************************************************* */
 
@@ -132,6 +144,229 @@ void callbackIsr(uint8_t *usbRcvBuffer, uint16_t count) {
 			assert(false);
 		}
 
+	}
+}
+
+//---------------------------------- Callbacks--------------------------------
+
+/**
+ * @brief Callback function called on BLE send completion
+ *
+ * @param [in]  sendStatus : event to be send by BLE during communication.
+ *
+ */
+static void BleAccelDataSentCallback(Retcode_T sendStatus) {
+	if (RETCODE_OK != sendStatus) {
+		printf(
+				"Error in transmitting the Accel Data over BLE. ERROR Code %ui  : \r\n",
+				(unsigned int) sendStatus);
+	}
+	if (xSemaphoreGive(SendCompleteSync) != pdTRUE) {
+		/*We would not expect this call to fail because we must have obtained the semaphore to get here.*/
+		Retcode_RaiseError(
+				RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_GIVE_ERROR));
+	}
+}
+
+/** The function to send start or stop message to Bidirectional DataExchange service
+ *  @param [in]  param1 : Unused, Reserved for future use
+ *  @param [in]  param2 : Differentiates start and stop command
+ */
+static void BleStartEndMsgSend(void * param1, uint32_t param2) {
+	BCDS_UNUSED(param1);
+	Retcode_T bleRetval = RETCODE_OK;
+
+	if (param2 == BLE_TRIGGER_START_CMD) {
+		bleRetval = BidirectionalService_SendData(
+				((uint8_t*) "X      Y      Z"),
+				((uint8_t) sizeof("X      Y      Z") - 1));
+	}
+	if (param2 == BLE_TRIGGER_END_CMD) {
+		bleRetval = BidirectionalService_SendData(
+				((uint8_t*) "Transfer Terminated!"),
+				((uint8_t) sizeof("Transfer Terminated!") - 1));
+	}
+	if (RETCODE_OK == bleRetval) {
+		if (pdFALSE == xSemaphoreTake(SendCompleteSync, BLE_SEND_TIMEOUT)) {
+			bleRetval = RETCODE(RETCODE_SEVERITY_ERROR,
+					SEMAPHORE_TIME_OUT_ERROR);
+		}
+	}
+	if (RETCODE_OK != bleRetval) {
+		printf(
+				"Not able to send response to start or stop command  on BLE  : \r\n");
+	}
+}
+
+/**
+ * @brief Callback function called on data reception over BLE
+ *
+ * @param [in]  rxBuffer : Buffer in which received data to be stored.
+ *
+ * @param [in]  rxDataLength : Length of received data.
+ */
+
+static void BleDataReceivedCallBack(uint8_t *rxBuffer, uint8_t rxDataLength) {
+	Retcode_T retVal = RETCODE_OK;
+	uint8_t bleReceiveBuff[BLE_RECEIVE_BUFFER_SIZE];
+	if (rxDataLength >= BLE_RECEIVE_BUFFER_SIZE) {
+		printf("Data length received is invalid \n");
+	} else {
+		memset(bleReceiveBuff, 0, sizeof(bleReceiveBuff));
+		memcpy(bleReceiveBuff, rxBuffer, rxDataLength);
+		/* make sure that the received string is null-terminated */
+		bleReceiveBuff[rxDataLength] = '\0';
+
+		/* validate received data */
+		if ((NUMBER_ZERO == strcmp((const char *) bleReceiveBuff, "start"))
+				&& (NUMBER_ZERO == bleTransmitStatus)) {
+			retVal = CmdProcessor_Enqueue(AppCmdProcessorHandle,
+					BleStartEndMsgSend, NULL, UINT32_C(1));
+			if (RETCODE_OK != retVal) {
+				printf(
+						"Failed to Enqueue BleStartEndMsgSend to Application Command Processor \r\n");
+			}
+			/* start accelerometer data transmission timer */
+			if (pdTRUE
+					!= xTimerStart(bleTransmitTimerHandle,
+							(ONESECONDDELAY/portTICK_RATE_MS))) {
+				/* Assertion Reason : Failed to start software timer. Check command queue size of software timer service*/
+				assert(false);
+			} else {
+				bleTransmitStatus = NUMBER_ONE;
+			}
+		} else if ((NUMBER_ZERO == strcmp((const char *) bleReceiveBuff, "end"))
+				&& (NUMBER_ONE == bleTransmitStatus)) {
+
+			/* stop accelerometer data transmission timer */
+			if (pdTRUE != xTimerStop(bleTransmitTimerHandle, NUMBER_ZERO)) {
+				/* Assertion Reason: Failed to start software timer. Check command queue size of software timer service. */
+				assert(false);
+			} else {
+				bleTransmitStatus = NUMBER_ZERO;
+				retVal = CmdProcessor_Enqueue(AppCmdProcessorHandle,
+						BleStartEndMsgSend, NULL, UINT32_C(0));
+				if (RETCODE_OK != retVal) {
+					printf(
+							"Failed to Enqueue BleStartEndMsgSend to Application Command Processor \r\n");
+				}
+			}
+
+		}
+	}
+}
+
+/**
+ *  The function to register the bidirectional service
+ */
+
+static Retcode_T BiDirectionalServiceRegistryCallback(void) {
+	Retcode_T retval = RETCODE_OK;
+
+	retval = BidirectionalService_Init(BleDataReceivedCallBack,
+			BleAccelDataSentCallback);
+	if (RETCODE_OK == retval) {
+		retval = BidirectionalService_Register();
+	}
+
+	return (retval);
+}
+
+/**
+ * @brief Callback function called on BLE event
+ *
+ * @param [in]  event : event to be send by BLE during communication.
+ *
+ * @param [in]  data : void pointer pointing to a data type based on event.
+ *                     currently reserved for future use
+ *
+ * event                                    |   data type                   |
+ * -----------------------------------------|-------------------------------|
+ * BLE_PERIPHERAL_STARTED                   |   Retcode_T                   |
+ * BLE_PERIPHERAL_SERVICES_REGISTERED       |   unused                      |
+ * BLE_PERIPHERAL_SLEEP_SUCCEEDED           |   Retcode_T                   |
+ * BLE_PERIPHERAL_WAKEUP_SUCCEEDED          |   Retcode_T                   |
+ * BLE_PERIPHERAL_CONNECTED                 |   Ble_RemoteDeviceAddress_T   |
+ * BLE_PERIPHERAL_DISCONNECTED              |   Ble_RemoteDeviceAddress_T   |
+ * BLE_PERIPHERAL_ERROR                     |   Retcode_T                   |
+ */
+static void BleEventCallBack(BlePeripheral_Event_T event, void * data) {
+
+	BlePeripheral_Event_T Event = event;
+	BCDS_UNUSED(data);
+	switch (Event) {
+	case BLE_PERIPHERAL_SERVICES_REGISTERED:
+		break;
+	case BLE_PERIPHERAL_STARTED:
+		printf("BLE powered ON successfully \r\n");
+		if (xSemaphoreGive(BleStartSyncSemphr) != pdTRUE) {
+			/* We would not expect this call to fail because we must have obtained the semaphore to get here.*/
+			Retcode_RaiseError(
+					RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_GIVE_ERROR));
+		}
+		break;
+
+	case BLE_PERIPHERAL_SLEEP_SUCCEEDED:
+		printf("BLE successfully entered into sleep mode \r\n");
+		break;
+
+	case BLE_PERIPHERAL_WAKEUP_SUCCEEDED:
+		printf("Device Wake up succceded  : \r\n");
+		if (xSemaphoreGive(BleWakeUpSyncSemphr) != pdTRUE) {
+			/*We would not expect this call to fail because we must have obtained the semaphore to get here.*/
+			Retcode_RaiseError(
+					RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_GIVE_ERROR));
+		}
+		break;
+
+	case BLE_PERIPHERAL_CONNECTED:
+		printf("Device connected  : \r\n");
+		break;
+
+	case BLE_PERIPHERAL_DISCONNECTED:
+		printf("Device Disconnected   : \r\n");
+		break;
+	case BLE_PERIPHERAL_ERROR:
+		printf("BLE Error Event  : \r\n");
+		break;
+
+	default:
+		/* assertion reason : invalid status of Bluetooth Device */
+		assert(false);
+		break;
+	}
+}
+
+/** The function to get and transfer the accel data using BLE alpwise DataExchange service
+ *
+ * @brief        Gets the raw data from BMA280 Accel and transfer through the alphwise DataExchange service on BLE
+ *
+ * @param[in]   *param1: a generic pointer to any context data structure which will be passed to the function when it is invoked by the command processor.
+ *
+ * @param[in]    param2: a generic 32 bit value  which will be passed to the function when it is invoked by the command processor.
+ */
+static void BleAccelDataTransmit(void * param1, uint32_t param2) {
+	BCDS_UNUSED(param1);
+	BCDS_UNUSED(param2);
+
+	printf("BleAccelDataTransmit ... CALLED\n\r");
+
+}
+
+/**
+ * @brief        This is a application timer callback function used to enqueue BleAccelDataTransmit function
+ *               to the command processor.
+ *
+ * @param[in]    pvParameters unused parameter.
+ */
+static void EnqueueAccelDatatoBLE(void *pvParameters) {
+	BCDS_UNUSED(pvParameters);
+
+	Retcode_T retVal = CmdProcessor_Enqueue(AppCmdProcessorHandle,
+			BleAccelDataTransmit, NULL, UINT32_C(0));
+	if (RETCODE_OK != retVal) {
+		printf(
+				"Failed to Enqueue BleAccelDataTransmit to Application Command Processor \r\n");
 	}
 }
 
@@ -206,6 +441,10 @@ void BleAlpwDataExchangeClient_CallBack(BleAlpwDataExchangeClientEvent event,
 
 }
 
+/*
+ *
+ */
+
 /* global functions ********************************************************* */
 
 //-----------------------------------------
@@ -216,82 +455,139 @@ void BleAlpwDataExchangeClient_CallBack(BleAlpwDataExchangeClientEvent event,
  */
 Retcode_T init(void) {
 
-	printf("Ble Central .. Initializing...\n\r");
+	printf("................ Ble Central -- Init()  ............. \n\r");
 
-	//(1)- -- Initialization
-	BleStatus returnValue = BLESTATUS_FAILED;	//BLESSTATUS_SUCCESS
+	//(0)- -- Init Ble Lower functions
+	Retcode_T retval = RETCODE_OK;
 
-	returnValue = BLEMGMT_Init();
+	bleTransmitTimerHandle = xTimerCreate(
+			(char * const ) "bleTransmitTimerHandle",
+			pdMS_TO_TICKS(BLE_TX_FREQ), TIMER_AUTORELOAD_ON, NULL,
+			EnqueueAccelDatatoBLE);
+	if (NULL != bleTransmitTimerHandle) {
+		retval = BlePeripheral_Initialize(BleEventCallBack,
+				BiDirectionalServiceRegistryCallback);
+		if (RETCODE_OK == retval) {
+			printf("BlePeripheral_Initialize ... OK \n\r");
 
-	if (returnValue == BLESTATUS_FAILED) {
-		return RETCODE_FAILURE;
+			retval = BlePeripheral_SetDeviceName(
+					(uint8_t*) XDK_BLE_DEVICE_NAME);
+		}
+		/* Powering on BLE module*/
+		if (RETCODE_OK == retval) {
+
+			retval = BlePeripheral_Start();
+		}
+		if (RETCODE_OK == retval) {
+			printf("BlePeripheral_Start ... OK \n\r");
+			if (pdTRUE
+					!= xSemaphoreTake(BleStartSyncSemphr,
+							BLE_START_SYNC_TIMEOUT)) {
+				printf(
+						"Failed to Start BLE before timeout, Ble Initialization failed \n");
+				retval = RETCODE(RETCODE_SEVERITY_ERROR,
+						SEMAPHORE_TIME_OUT_ERROR);
+			}
+		}
+		if (RETCODE_OK == retval) {
+			retval = BlePeripheral_Wakeup();
+		}
+		/* Wake up BLE module*/
+		if (RETCODE_OK == retval) {
+			printf("BlePeripheral_Wakeup ... OK \n\r");
+
+			if (pdTRUE
+					!= xSemaphoreTake(BleWakeUpSyncSemphr,
+							BLE_WAKEUP_SYNC_TIMEOUT)) {
+				printf(
+						"Failed to Wake up BLE before timeout, Ble Initialization failed \n");
+				retval = RETCODE(RETCODE_SEVERITY_ERROR,
+						SEMAPHORE_TIME_OUT_ERROR);
+			}
+		}
+		if (RETCODE_OK == retval) {
+			printf(" Ble Initialization succeded \n");
+		} else {
+			printf("Ble Initialization Failed \r\n");
+		}
+
+		//(1)- -- Initialization
+		BleStatus returnValue = BLESTATUS_FAILED;	//BLESSTATUS_SUCCESS
+
+		returnValue = BLEMGMT_Init();
+
+		if (returnValue == BLESTATUS_FAILED) {
+			return RETCODE_FAILURE;
+		}
+		printf("BLEMGMT_Init ... OK \n\r");
+
+		bleHandler.callback = CORESTACK_BleCallback;
+
+		returnValue = BLEMGMT_RegisterHandler(&bleHandler);
+
+		if (returnValue != BLESTATUS_SUCCESS) {
+			return RETCODE_FAILURE;
+		}
+
+		printf("BLEMGMT_RegisterHandler ... OK \n\r");
+
+		//--  register device
+		returnValue = BLEGAP_RegisterDevice(BLEGAPROLE_CENTRAL,
+				BleGap_CallBack);
+
+		if (returnValue != BLESTATUS_SUCCESS) {
+			return RETCODE_FAILURE;
+		}
+		printf("BLEGAP_RegisterDevice ... OK \n\r");
+
+		//-- init client
+		returnValue = BLEALPWDATAEXCHANGE_CLIENT_Init(
+				BleAlpwDataExchangeClient_CallBack);
+		if (returnValue != BLESTATUS_SUCCESS) {
+			return RETCODE_FAILURE;
+		}
+
+		printf("BLEALPWDATAEXCHANGE_CLIENT_Init ... OK \n\r");
+
+		//(2)- -- Link-up
+		hc05Ble_address.addr[0] = 0x98;
+		hc05Ble_address.addr[1] = 0xD3;
+		hc05Ble_address.addr[2] = 0x34;
+		hc05Ble_address.addr[3] = 0x91;
+		hc05Ble_address.addr[4] = 0x2D;
+		hc05Ble_address.addr[5] = 0x0E;
+
+		returnValue = BLEGAP_Connect(&hc05Ble_address, BLEADDRESS_PUBLIC);// returns pending
+
+		if (returnValue == BLESTATUS_FAILED) {
+			return RETCODE_FAILURE;
+		}
+		printf("BLEGAP_Connect ... OK \n\r");
+
+		vTaskDelay(10000);
+
+		//--- Operation:send some data
+		int i = 0;
+		for (i = 0; i < 10; i++) {
+			txData[i] = i + 10;
+		}
+
+		printf("Sending some data \n\r");
+
+		returnValue = BLEALPWDATAEXCHANGE_CLIENT_SendData(
+				&bleAlpwDataExchangeClient, txData, 10,
+				BLEALPWDATAEXCHANGE_CLIENT_DATA_RELIABLE);
+
+		printf("BLEGAP_RegisterDevice returned %d \n\r", returnValue);
+
+		if (returnValue == BLESTATUS_FAILED) {
+			return RETCODE_FAILURE;
+		}
+		printf("BLEALPWDATAEXCHANGE_CLIENT_SendData ... OK \n\r");
+
+		return RETCODE_OK;
+
 	}
-	printf("BLEMGMT_Init OK \n\r");
-
-	bleHandler.callback = CORESTACK_BleCallback;
-
-	returnValue = BLEMGMT_RegisterHandler(&bleHandler);
-
-	if (returnValue != BLESTATUS_SUCCESS) {
-		return RETCODE_FAILURE;
-	}
-
-	printf("BLEMGMT_RegisterHandler OK \n\r");
-
-	//--  register device
-	returnValue = BLEGAP_RegisterDevice(BLEGAPROLE_CENTRAL, BleGap_CallBack);
-
-	if (returnValue != BLESTATUS_SUCCESS) {
-		return RETCODE_FAILURE;
-	}
-	printf("BLEGAP_RegisterDevice OK \n\r");
-
-	//-- init client
-	returnValue = BLEALPWDATAEXCHANGE_CLIENT_Init(
-			BleAlpwDataExchangeClient_CallBack);
-	if (returnValue != BLESTATUS_SUCCESS) {
-		return RETCODE_FAILURE;
-	}
-
-	printf("BLEALPWDATAEXCHANGE_CLIENT_Init OK \n\r");
-
-	//(2)- -- Link-up
-	hc05Ble_address.addr[0] = 0xC4;
-	hc05Ble_address.addr[1] = 0x86;
-	hc05Ble_address.addr[2] = 0xE9;
-	hc05Ble_address.addr[3] = 0xF6;
-	hc05Ble_address.addr[4] = 0x2C;
-	hc05Ble_address.addr[5] = 0xFB;
-
-	returnValue = BLEGAP_Connect(&hc05Ble_address, BLEADDRESS_PUBLIC);// returns pending
-
-	if (returnValue == BLESTATUS_FAILED) {
-		return RETCODE_FAILURE;
-	}
-	printf("BLEGAP_Connect OK \n\r");
-
-	vTaskDelay(10000);
-
-	//--- Operation:send some data
-	int i = 0;
-	for (i = 0; i < 10; i++) {
-		txData[i] = i + 10;
-	}
-
-	printf("Sending some data \n\r");
-
-	returnValue = BLEALPWDATAEXCHANGE_CLIENT_SendData(
-			&bleAlpwDataExchangeClient, txData, 10,
-			BLEALPWDATAEXCHANGE_CLIENT_DATA_RELIABLE);
-
-	printf("BLEGAP_RegisterDevice returned %d \n\r", returnValue);
-
-	if (returnValue == BLESTATUS_FAILED) {
-		return RETCODE_FAILURE;
-	}
-
-	return RETCODE_OK;
-
 }
 
 /**
@@ -331,5 +627,6 @@ void appInitSystem(void * CmdProcessorHandle, uint32_t param2) {
 		printf("Example_Ble_Master App Initialization failed \r\n ");
 	}
 }
+
 /**@} */
 /** ************************************************************************* */
