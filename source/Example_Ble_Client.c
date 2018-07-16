@@ -88,7 +88,7 @@ static volatile uint8_t isInterruptHandled = ENABLE_FLAG;
 static uint8_t recievedData[MAX_DEVICE_LENGTH];
 
 static BleHandler bleHandler;
-static BD_ADDR hc05Ble_address; // hc05 ARDUINO module BLE Address
+static BD_ADDR hc05Ble; // hc05 ARDUINO module BLE Address
 static U8 txData[10];
 
 static BleAlpwDataExchangeClient bleAlpwDataExchangeClient;
@@ -375,7 +375,7 @@ static void EnqueueAccelDatatoBLE(void *pvParameters) {
  */
 void CORESTACK_BleCallback(BleEvent event, BleStatus status, void *param) {
 
-	printf("CORESTACK_BleCallback event:%d, status: %d  \n\r", event, status);
+	printf("CORESTACK_BleCallback event: 0x%02X, status: %d  \n\r", event, status);
 
 	switch (event) {
 	case BLEEVENT_INITIALIZATION_RSP:
@@ -383,6 +383,7 @@ void CORESTACK_BleCallback(BleEvent event, BleStatus status, void *param) {
 		break;
 	case BLEEVENT_PAIRING_COMPLETE:
 		printf("pairing completed %d  \n\r", status);
+
 		break;
 	default:
 		break;
@@ -457,8 +458,26 @@ Retcode_T init(void) {
 
 	printf("................ Ble Central -- Init()  ............. \n\r");
 
-	//(0)- -- Init Ble Lower functions
+	//(0)- -- Init low level functions
 	Retcode_T retval = RETCODE_OK;
+
+	static_assert((portTICK_RATE_MS != 0), "Tick rate MS is zero");
+
+	BleStartSyncSemphr = xSemaphoreCreateBinary();
+	if (NULL == BleStartSyncSemphr) {
+		return (RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_CREATE_ERROR));
+	}
+	BleWakeUpSyncSemphr = xSemaphoreCreateBinary();
+	if (NULL == BleWakeUpSyncSemphr) {
+		return (RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_CREATE_ERROR));
+	}
+	SendCompleteSync = xSemaphoreCreateBinary();
+	if (NULL == SendCompleteSync) {
+		return (RETCODE(RETCODE_SEVERITY_ERROR, SEMAPHORE_CREATE_ERROR));
+	}
+
+	/*initialize accel sensor*/
+	retval = Accelerometer_init(xdkAccelerometers_BMA280_Handle);
 
 	bleTransmitTimerHandle = xTimerCreate(
 			(char * const ) "bleTransmitTimerHandle",
@@ -480,6 +499,7 @@ Retcode_T init(void) {
 		}
 		if (RETCODE_OK == retval) {
 			printf("BlePeripheral_Start ... OK \n\r");
+
 			if (pdTRUE
 					!= xSemaphoreTake(BleStartSyncSemphr,
 							BLE_START_SYNC_TIMEOUT)) {
@@ -487,6 +507,7 @@ Retcode_T init(void) {
 						"Failed to Start BLE before timeout, Ble Initialization failed \n");
 				retval = RETCODE(RETCODE_SEVERITY_ERROR,
 						SEMAPHORE_TIME_OUT_ERROR);
+
 			}
 		}
 		if (RETCODE_OK == retval) {
@@ -506,7 +527,7 @@ Retcode_T init(void) {
 			}
 		}
 		if (RETCODE_OK == retval) {
-			printf(" Ble Initialization succeded \n");
+			printf("Ble Initialization succeded \n");
 		} else {
 			printf("Ble Initialization Failed \r\n");
 		}
@@ -550,20 +571,23 @@ Retcode_T init(void) {
 		printf("BLEALPWDATAEXCHANGE_CLIENT_Init ... OK \n\r");
 
 		//(2)- -- Link-up
-		hc05Ble_address.addr[0] = 0x98;
-		hc05Ble_address.addr[1] = 0xD3;
-		hc05Ble_address.addr[2] = 0x34;
-		hc05Ble_address.addr[3] = 0x91;
-		hc05Ble_address.addr[4] = 0x2D;
-		hc05Ble_address.addr[5] = 0x0E;
+		hc05Ble.addr[0] = 0x98  ; //0xC4;
+		hc05Ble.addr[1] = 0xD3  ; //0x86;
+		hc05Ble.addr[2] = 0x34  ; //0xE9;
+		hc05Ble.addr[3] = 0x91  ; //0xF6;
+		hc05Ble.addr[4] = 0x2D  ; //0x2C;
+		hc05Ble.addr[5] = 0x0E  ; //0xFB;
 
-		returnValue = BLEGAP_Connect(&hc05Ble_address, BLEADDRESS_PUBLIC);// returns pending
+		returnValue = BLEGAP_Connect(&hc05Ble, BLEADDRESS_PUBLIC); // returns pending
 
 		if (returnValue == BLESTATUS_FAILED) {
 			return RETCODE_FAILURE;
 		}
 		printf("BLEGAP_Connect ... OK \n\r");
 
+
+		//-- wait for some time
+		printf("Waiting for 10s ... OK \n\r");
 		vTaskDelay(10000);
 
 		//--- Operation:send some data
@@ -571,14 +595,15 @@ Retcode_T init(void) {
 		for (i = 0; i < 10; i++) {
 			txData[i] = i + 10;
 		}
-
+		BLEGATT_SUPPORT_WRITE_CHARACTERISTIC_WITHOUT_RESPONSE;
 		printf("Sending some data \n\r");
 
 		returnValue = BLEALPWDATAEXCHANGE_CLIENT_SendData(
 				&bleAlpwDataExchangeClient, txData, 10,
-				BLEALPWDATAEXCHANGE_CLIENT_DATA_RELIABLE);
+				BLEALPWDATAEXCHANGE_CLIENT_DATA_NOT_RELIABLE);
 
-		printf("BLEGAP_RegisterDevice returned %d \n\r", returnValue);
+		printf("BLEALPWDATAEXCHANGE_CLIENT_SendData returned %d \n\r",
+				returnValue);
 
 		if (returnValue == BLESTATUS_FAILED) {
 			return RETCODE_FAILURE;
